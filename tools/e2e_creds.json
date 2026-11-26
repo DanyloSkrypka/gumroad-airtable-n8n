@@ -1,0 +1,8 @@
+[
+  {"id": "AirtablePAT00001", "name": "Airtable PAT", "type": "airtableTokenApi",
+   "data": {"accessToken": "patFAKE_TEST_TOKEN_NOT_REAL.0000000000000000"}},
+  {"id": "SmtpAlerts000001", "name": "SMTP (alerts)", "type": "smtp",
+   "data": {"user": "", "password": "", "host": "127.0.0.1", "port": 2525, "secure": false, "disableStartTls": true}},
+  {"id": "GumroadToken0001", "name": "Gumroad API", "type": "gumroadApi",
+   "data": {"accessToken": "FAKE_TEST_TOKEN_NOT_REAL"}}
+]

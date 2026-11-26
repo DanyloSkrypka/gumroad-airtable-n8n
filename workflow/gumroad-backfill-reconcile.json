@@ -1,0 +1,531 @@
+{
+  "id": "GumroadBackfl001",
+  "name": "Gumroad -> Airtable (backfill & nightly reconcile)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Gumroad -> Airtable: backfill & reconcile\n* **Manual run** = import ALL past sales once.\n* **Nightly** = re-check the last 3 days. Catches any ping Gumroad dropped (Gumroad retries a failed ping only 4 times, then gives up).\n\nUpsert on Sale ID, so running it 10 times still gives one row per sale.\nNeeds credential *Gumroad API* (access token from Gumroad > Settings > Advanced > Applications).",
+        "height": 320,
+        "width": 520,
+        "color": 7
+      },
+      "id": "ee1104b9-fd97-5939-bcba-14fe43e60bb2",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -600,
+        120
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "35be5619-e12f-59a3-b07d-7c95e18b2830",
+      "name": "Run full backfill (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 3
+            }
+          ]
+        }
+      },
+      "id": "88edd17a-e89f-5042-a948-2e0e7688be44",
+      "name": "Every night 03:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "04e5f04a-464e-520f-903c-700d8a9655a1",
+              "name": "after",
+              "value": "2010-01-01",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "3bdb6260-f034-56c9-afd3-488059283ae7",
+      "name": "From: all time",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "6254be41-5c37-5d45-900f-4b36c96ab98c",
+              "name": "after",
+              "value": "={{ $now.minus({ days: 3 }).toFormat('yyyy-MM-dd') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cb2769c0-1d98-5089-8af2-8ba1c03dc0c2",
+      "name": "From: last 3 days",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.gumroad.com/v2/sales",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "gumroadApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "after",
+              "value": "={{ $json.after }}"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "page_key",
+                    "value": "={{ $response.body.next_page_key }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.next_page_key }}",
+              "limitPagesFetched": true,
+              "maxRequests": 500,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "id": "436326bb-548d-5597-a47d-740e3975487f",
+      "name": "Gumroad API: list sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        300
+      ],
+      "credentials": {
+        "gumroadApi": {
+          "id": "GumroadToken0001",
+          "name": "Gumroad API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "GET /v2/sales, 100 per page, follows next_page_key.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "sales",
+        "options": {}
+      },
+      "id": "9421d547-b6ab-5063-a8b6-e2b21562457b",
+      "name": "One item per sale",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize + validate Gumroad sales for Airtable.\n// Works for both inputs:\n//   - Gumroad Ping (Webhook node item: { body: {...form fields...}, headers, query })\n//   - Gumroad API  (one sale object from GET /v2/sales, after \"Split Out\")\n// Output keys are EXACT Airtable column names (Airtable node uses auto-mapping).\n// Keys starting with \"_\" are control fields and are ignored by the Airtable node.\n//\n// Dedup strategy:\n//   1) Airtable \"Create or Update\" merges on \"Sale ID\"  -> one row per sale, ever.\n//   2) Duplicates inside one run (overlapping API pages, repeated pings) are merged here.\n//   3) Refund pings carry the SAME sale_id -> they update the existing row (Refunded = true).\n//      \"Refunded\"/\"Disputed\" are only written when true, so a late or retried \"sale\" ping\n//      can never un-refund a row.\n\nconst SKIP_TEST_SALES = false; // true = drop test pings (your own purchases, \"Send test ping\")\nconst ZERO_DECIMAL = ['jpy', 'krw']; // API amounts in these currencies have no minor units\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n\nconst str = (v) => (v === undefined || v === null ? '' : String(v).trim());\nconst toBool = (v) => v === true || v === 1 || ['true', '1', 'yes'].includes(str(v).toLowerCase());\nconst toInt = (v) => (/^-?\\d+$/.test(str(v)) ? parseInt(str(v), 10) : NaN);\n\n// Gumroad posts x-www-form-urlencoded. Nested hashes arrive as flat keys: \"variants[Size]=L\".\n// Accepts a nested object, flat bracket keys, or a plain string.\nfunction collect(src, name) {\n  const v = src[name];\n  if (v && typeof v === 'object' && !Array.isArray(v)) return v;\n  const out = {};\n  const prefix = name + '[';\n  for (const k of Object.keys(src)) {\n    if (k.startsWith(prefix) && k.endsWith(']')) out[k.slice(prefix.length, -1)] = src[k];\n  }\n  if (Object.keys(out).length) return out;\n  return str(v) ? { value: str(v) } : {};\n}\nconst dictToText = (d) =>\n  Object.entries(d)\n    .filter(([, v]) => str(v) !== '')\n    .map(([k, v]) => (k === 'value' ? str(v) : `${k}: ${str(v)}`))\n    .join(', ');\n\nfunction normalizeOne(json) {\n  const isPing = json && typeof json.body === 'object' && json.body !== null;\n  const src = isPing ? json.body : json || {};\n  const errors = [];\n\n  const pingFormat = isPing || src.sale_id !== undefined;\n  let saleId, ts, cents, currency, orderNumber, permalink, event, refunded, disputed, test, offer, country;\n  if (pingFormat) {\n    // Ping format (also used by the local test runner without a \"body\" wrapper)\n    saleId = str(src.sale_id);\n    ts = str(src.sale_timestamp);\n    cents = toInt(src.price); // Ping: ALWAYS USD cents, whatever \"currency\" says\n    currency = 'USD';\n    orderNumber = toInt(src.order_number);\n    permalink = str(src.product_permalink);\n    event = str(src.resource_name) || 'sale';\n    refunded = toBool(src.refunded) || event === 'refund';\n    disputed = toBool(src.disputed) || event === 'dispute';\n    test = toBool(src.test);\n    offer = str(src.offer_code);\n    country = str(src.ip_country);\n  } else {\n    // API format (GET /v2/sales): price is in the sale currency's minor units\n    saleId = str(src.id);\n    ts = str(src.created_at);\n    currency = str(src.currency).toUpperCase() || 'USD';\n    cents = toInt(src.price);\n    orderNumber = toInt(src.order_id);\n    permalink = str(src.product_permalink);\n    event = 'api-sync';\n    refunded = toBool(src.refunded);\n    disputed = toBool(src.disputed) || toBool(src.chargedback);\n    offer = src.offer_code && typeof src.offer_code === 'object' ? str(src.offer_code.code || src.offer_code.name) : str(src.offer_code);\n    country = str(src.country || src.ip_country);\n  }\n\n  const email = str(src.email || src.purchase_email).toLowerCase();\n  const productId = str(src.product_id);\n  const date = new Date(ts);\n\n  if (!saleId) errors.push('missing sale_id');\n  if (!EMAIL_RE.test(email)) errors.push(`invalid email \"${email}\"`);\n  if (!ts || isNaN(date.getTime())) errors.push(`invalid sale timestamp \"${ts}\"`);\n  if (isNaN(cents) || cents < 0) errors.push(`invalid price \"${str(src.price)}\"`);\n  if (!productId) errors.push('missing product_id');\n\n  const divisor = ZERO_DECIMAL.includes(currency.toLowerCase()) ? 1 : 100;\n  const quantity = toInt(src.quantity);\n\n  const rec = {\n    'Sale ID': saleId,\n    'Order Number': isNaN(orderNumber) ? undefined : orderNumber,\n    'Sale Date': errors.some((e) => e.startsWith('invalid sale timestamp')) ? undefined : date.toISOString(),\n    Email: email,\n    'Full Name': str(src.full_name),\n    'Product Name': str(src.product_name),\n    'Product ID': productId,\n    'Product Permalink': permalink,\n    Amount: isNaN(cents) ? undefined : Math.round((cents / divisor) * 100) / 100,\n    Currency: currency,\n    Quantity: isNaN(quantity) ? undefined : quantity,\n    Variants: dictToText(collect(src, 'variants')),\n    'Offer Code': offer,\n    Country: country,\n    'Can Contact': toBool(src.can_contact),\n    'Subscription ID': str(src.subscription_id),\n    Test: pingFormat ? test : undefined, // the API has no test flag: never overwrite the ping's value\n    Source: pingFormat ? 'Gumroad Ping' : 'Gumroad API',\n    'Last Event': event,\n    'Synced At': new Date().toISOString(),\n  };\n  if (refunded) rec.Refunded = true;\n  if (disputed) rec.Disputed = true;\n\n  // Drop empty values so an update never blanks out a column\n  for (const k of Object.keys(rec)) if (rec[k] === undefined || rec[k] === '') delete rec[k];\n\n  rec._valid = errors.length === 0;\n  rec._errors = errors.join('; ');\n  return rec;\n}\n\nfunction normalizeAll(items) {\n  const bySale = new Map();\n  const out = [];\n  for (const item of items) {\n    const rec = normalizeOne(item.json);\n    if (SKIP_TEST_SALES && rec.Test) continue;\n    if (!rec._valid) {\n      out.push(rec);\n      continue;\n    }\n    const prev = bySale.get(rec['Sale ID']);\n    if (prev) {\n      // same sale twice in one run: keep the newest data, never lose a refund/dispute flag\n      const merged = { ...prev, ...rec };\n      if (prev.Refunded || rec.Refunded) merged.Refunded = true;\n      if (prev.Disputed || rec.Disputed) merged.Disputed = true;\n      bySale.set(rec['Sale ID'], merged);\n    } else {\n      bySale.set(rec['Sale ID'], rec);\n    }\n  }\n  return [...bySale.values(), ...out];\n}\n\n// n8n Code node entry point (\"Run Once for All Items\")\nreturn normalizeAll($input.all()).map((json) => ({ json }));\n"
+      },
+      "id": "1d28b298-1385-5bc9-b75f-b663ddca940e",
+      "name": "Normalize & validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ],
+      "notes": "Same code as the live workflow. Merges duplicates inside the run.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ef8e6c66-ebf6-5a6b-93e8-382349bb2568",
+              "leftValue": "={{ $json._valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "579f86df-919d-5327-85cd-1b295bc38aaa",
+      "name": "Valid sale?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 4,
+        "options": {}
+      },
+      "id": "11815e92-b850-598b-8a32-a20d3a502f9f",
+      "name": "Batches of 4",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1340,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "base": {
+          "__rl": true,
+          "value": "appYourBaseId",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "Sales",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "Sale ID"
+          ],
+          "schema": [
+            {
+              "id": "Sale ID",
+              "displayName": "Sale ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "typecast": true,
+          "ignoreFields": "_valid,_errors"
+        }
+      },
+      "id": "98a47046-9e29-5cb1-ad80-c58ee4c19995",
+      "name": "Airtable: upsert by Sale ID",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        1580,
+        120
+      ],
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "AirtablePAT00001",
+          "name": "Airtable PAT"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Create or Update, merge on 'Sale ID' = idempotent. Same sale twice -> same row.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "amount": 1,
+        "unit": "seconds"
+      },
+      "id": "96e90a66-42d4-545e-9ac6-afe744424d29",
+      "name": "Respect Airtable 5 req/s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1800,
+        120
+      ],
+      "webhookId": "7ba3c5f4-fa95-5063-ac63-9b1d9c7ec938"
+    },
+    {
+      "parameters": {
+        "errorMessage": "=Invalid Gumroad payload (sale {{ $json['Sale ID'] || '?' }}): {{ $json._errors }}"
+      },
+      "id": "c4c11e1c-9d24-5012-857f-bfbfa1e5686c",
+      "name": "Reject invalid payload",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1340,
+        460
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "3f485db0-3d9f-593b-9542-5b47f26ffbb2",
+      "name": "On any error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds a readable alert from the Error Trigger output.\n// Runs for: Airtable write failed (after 3 retries), invalid Gumroad payload, any other crash.\nconst e = $input.first().json;\nconst exec = e.execution || {};\nconst trig = e.trigger || {};\nconst err = exec.error || trig.error || {};\nconst wf = (e.workflow && e.workflow.name) || 'Gumroad -> Airtable';\n\nconst subject = `[n8n] ${wf} failed: ${(err.message || 'unknown error').slice(0, 120)}`;\nconst text = [\n  `Workflow: ${wf}`,\n  `Failed node: ${exec.lastNodeExecuted || '(trigger)'}`,\n  `Error: ${err.message || 'unknown'}`,\n  exec.url ? `Open the failed run: ${exec.url}` : null,\n  exec.id ? `Execution ID: ${exec.id}` : null,\n  `Time (UTC): ${new Date().toISOString()}`,\n  '',\n  'This event may be missing in Airtable. Fix the cause, then either retry the execution',\n  'from the link above or run the \"Gumroad -> Airtable: backfill & reconcile\" workflow,',\n  'which re-syncs recent sales without creating duplicates.',\n]\n  .filter((l) => l !== null)\n  .join('\\n');\n\nreturn [{ json: { subject, text } }];\n"
+      },
+      "id": "2527d048-61b7-5d4e-bf77-59cda03151be",
+      "name": "Format alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "n8n-alerts@example.com",
+        "toEmail": "you@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "139f12d5-771b-50ed-b90b-2e5ffec61ad0",
+      "name": "Email alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        440,
+        760
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SmtpAlerts000001",
+          "name": "SMTP (alerts)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Run full backfill (manual)": {
+      "main": [
+        [
+          {
+            "node": "From: all time",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every night 03:00": {
+      "main": [
+        [
+          {
+            "node": "From: last 3 days",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "From: all time": {
+      "main": [
+        [
+          {
+            "node": "Gumroad API: list sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "From: last 3 days": {
+      "main": [
+        [
+          {
+            "node": "Gumroad API: list sales",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gumroad API: list sales": {
+      "main": [
+        [
+          {
+            "node": "One item per sale",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per sale": {
+      "main": [
+        [
+          {
+            "node": "Normalize & validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & validate": {
+      "main": [
+        [
+          {
+            "node": "Valid sale?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid sale?": {
+      "main": [
+        [
+          {
+            "node": "Batches of 4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject invalid payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batches of 4": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Airtable: upsert by Sale ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Airtable: upsert by Sale ID": {
+      "main": [
+        [
+          {
+            "node": "Respect Airtable 5 req/s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respect Airtable 5 req/s": {
+      "main": [
+        [
+          {
+            "node": "Batches of 4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On any error": {
+      "main": [
+        [
+          {
+            "node": "Format alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format alert": {
+      "main": [
+        [
+          {
+            "node": "Email alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

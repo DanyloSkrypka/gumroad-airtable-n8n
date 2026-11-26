@@ -1,0 +1,285 @@
+{
+  "id": "GumroadAirtbl001",
+  "name": "Gumroad -> Airtable (live sales)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Gumroad -> Airtable (live)\nEvery Gumroad sale/refund ping -> one row in Airtable **Sales**, keyed by **Sale ID**.\n\n1. Credentials: *Airtable PAT* (scopes data.records:read/write, schema.bases:read) and *SMTP (alerts)*.\n2. Airtable node: pick your base, table `Sales`.\n3. Email alert: set your address.\n4. Publish/activate, copy the **Production URL** of the webhook into Gumroad Ping.\n\nErrors (Airtable down, bad payload) -> email via the Error Trigger below. This workflow is its own error workflow.",
+        "height": 380,
+        "width": 520,
+        "color": 7
+      },
+      "id": "5ae570a6-f331-5943-a157-fd4db79fdab3",
+      "name": "README",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -600,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gumroad-sale",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "97c2df38-4bb1-5142-8f93-3d16e47a0f01",
+      "name": "Gumroad Ping (sale webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "4b9b3ee6-3e15-5f43-87ed-9af0f10f1a2b",
+      "notes": "Responds 200 instantly (Gumroad gives 5 s). Paste the Production URL into Gumroad > Settings > Advanced > Ping.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize + validate Gumroad sales for Airtable.\n// Works for both inputs:\n//   - Gumroad Ping (Webhook node item: { body: {...form fields...}, headers, query })\n//   - Gumroad API  (one sale object from GET /v2/sales, after \"Split Out\")\n// Output keys are EXACT Airtable column names (Airtable node uses auto-mapping).\n// Keys starting with \"_\" are control fields and are ignored by the Airtable node.\n//\n// Dedup strategy:\n//   1) Airtable \"Create or Update\" merges on \"Sale ID\"  -> one row per sale, ever.\n//   2) Duplicates inside one run (overlapping API pages, repeated pings) are merged here.\n//   3) Refund pings carry the SAME sale_id -> they update the existing row (Refunded = true).\n//      \"Refunded\"/\"Disputed\" are only written when true, so a late or retried \"sale\" ping\n//      can never un-refund a row.\n\nconst SKIP_TEST_SALES = false; // true = drop test pings (your own purchases, \"Send test ping\")\nconst ZERO_DECIMAL = ['jpy', 'krw']; // API amounts in these currencies have no minor units\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n\nconst str = (v) => (v === undefined || v === null ? '' : String(v).trim());\nconst toBool = (v) => v === true || v === 1 || ['true', '1', 'yes'].includes(str(v).toLowerCase());\nconst toInt = (v) => (/^-?\\d+$/.test(str(v)) ? parseInt(str(v), 10) : NaN);\n\n// Gumroad posts x-www-form-urlencoded. Nested hashes arrive as flat keys: \"variants[Size]=L\".\n// Accepts a nested object, flat bracket keys, or a plain string.\nfunction collect(src, name) {\n  const v = src[name];\n  if (v && typeof v === 'object' && !Array.isArray(v)) return v;\n  const out = {};\n  const prefix = name + '[';\n  for (const k of Object.keys(src)) {\n    if (k.startsWith(prefix) && k.endsWith(']')) out[k.slice(prefix.length, -1)] = src[k];\n  }\n  if (Object.keys(out).length) return out;\n  return str(v) ? { value: str(v) } : {};\n}\nconst dictToText = (d) =>\n  Object.entries(d)\n    .filter(([, v]) => str(v) !== '')\n    .map(([k, v]) => (k === 'value' ? str(v) : `${k}: ${str(v)}`))\n    .join(', ');\n\nfunction normalizeOne(json) {\n  const isPing = json && typeof json.body === 'object' && json.body !== null;\n  const src = isPing ? json.body : json || {};\n  const errors = [];\n\n  const pingFormat = isPing || src.sale_id !== undefined;\n  let saleId, ts, cents, currency, orderNumber, permalink, event, refunded, disputed, test, offer, country;\n  if (pingFormat) {\n    // Ping format (also used by the local test runner without a \"body\" wrapper)\n    saleId = str(src.sale_id);\n    ts = str(src.sale_timestamp);\n    cents = toInt(src.price); // Ping: ALWAYS USD cents, whatever \"currency\" says\n    currency = 'USD';\n    orderNumber = toInt(src.order_number);\n    permalink = str(src.product_permalink);\n    event = str(src.resource_name) || 'sale';\n    refunded = toBool(src.refunded) || event === 'refund';\n    disputed = toBool(src.disputed) || event === 'dispute';\n    test = toBool(src.test);\n    offer = str(src.offer_code);\n    country = str(src.ip_country);\n  } else {\n    // API format (GET /v2/sales): price is in the sale currency's minor units\n    saleId = str(src.id);\n    ts = str(src.created_at);\n    currency = str(src.currency).toUpperCase() || 'USD';\n    cents = toInt(src.price);\n    orderNumber = toInt(src.order_id);\n    permalink = str(src.product_permalink);\n    event = 'api-sync';\n    refunded = toBool(src.refunded);\n    disputed = toBool(src.disputed) || toBool(src.chargedback);\n    offer = src.offer_code && typeof src.offer_code === 'object' ? str(src.offer_code.code || src.offer_code.name) : str(src.offer_code);\n    country = str(src.country || src.ip_country);\n  }\n\n  const email = str(src.email || src.purchase_email).toLowerCase();\n  const productId = str(src.product_id);\n  const date = new Date(ts);\n\n  if (!saleId) errors.push('missing sale_id');\n  if (!EMAIL_RE.test(email)) errors.push(`invalid email \"${email}\"`);\n  if (!ts || isNaN(date.getTime())) errors.push(`invalid sale timestamp \"${ts}\"`);\n  if (isNaN(cents) || cents < 0) errors.push(`invalid price \"${str(src.price)}\"`);\n  if (!productId) errors.push('missing product_id');\n\n  const divisor = ZERO_DECIMAL.includes(currency.toLowerCase()) ? 1 : 100;\n  const quantity = toInt(src.quantity);\n\n  const rec = {\n    'Sale ID': saleId,\n    'Order Number': isNaN(orderNumber) ? undefined : orderNumber,\n    'Sale Date': errors.some((e) => e.startsWith('invalid sale timestamp')) ? undefined : date.toISOString(),\n    Email: email,\n    'Full Name': str(src.full_name),\n    'Product Name': str(src.product_name),\n    'Product ID': productId,\n    'Product Permalink': permalink,\n    Amount: isNaN(cents) ? undefined : Math.round((cents / divisor) * 100) / 100,\n    Currency: currency,\n    Quantity: isNaN(quantity) ? undefined : quantity,\n    Variants: dictToText(collect(src, 'variants')),\n    'Offer Code': offer,\n    Country: country,\n    'Can Contact': toBool(src.can_contact),\n    'Subscription ID': str(src.subscription_id),\n    Test: pingFormat ? test : undefined, // the API has no test flag: never overwrite the ping's value\n    Source: pingFormat ? 'Gumroad Ping' : 'Gumroad API',\n    'Last Event': event,\n    'Synced At': new Date().toISOString(),\n  };\n  if (refunded) rec.Refunded = true;\n  if (disputed) rec.Disputed = true;\n\n  // Drop empty values so an update never blanks out a column\n  for (const k of Object.keys(rec)) if (rec[k] === undefined || rec[k] === '') delete rec[k];\n\n  rec._valid = errors.length === 0;\n  rec._errors = errors.join('; ');\n  return rec;\n}\n\nfunction normalizeAll(items) {\n  const bySale = new Map();\n  const out = [];\n  for (const item of items) {\n    const rec = normalizeOne(item.json);\n    if (SKIP_TEST_SALES && rec.Test) continue;\n    if (!rec._valid) {\n      out.push(rec);\n      continue;\n    }\n    const prev = bySale.get(rec['Sale ID']);\n    if (prev) {\n      // same sale twice in one run: keep the newest data, never lose a refund/dispute flag\n      const merged = { ...prev, ...rec };\n      if (prev.Refunded || rec.Refunded) merged.Refunded = true;\n      if (prev.Disputed || rec.Disputed) merged.Disputed = true;\n      bySale.set(rec['Sale ID'], merged);\n    } else {\n      bySale.set(rec['Sale ID'], rec);\n    }\n  }\n  return [...bySale.values(), ...out];\n}\n\n// n8n Code node entry point (\"Run Once for All Items\")\nreturn normalizeAll($input.all()).map((json) => ({ json }));\n"
+      },
+      "id": "f295335a-0d40-5771-ba9f-5ac2ad7f98ab",
+      "name": "Normalize & validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Form fields -> clean typed columns. Validates sale_id, email, date, price, product_id.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ec205bb3-dcd0-5a7c-8abf-01b1097b6b2f",
+              "leftValue": "={{ $json._valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b4ef75f2-63e7-50d6-b273-f1119be97eb9",
+      "name": "Valid sale?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "base": {
+          "__rl": true,
+          "value": "appYourBaseId",
+          "mode": "id"
+        },
+        "table": {
+          "__rl": true,
+          "value": "Sales",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "Sale ID"
+          ],
+          "schema": [
+            {
+              "id": "Sale ID",
+              "displayName": "Sale ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {
+          "typecast": true,
+          "ignoreFields": "_valid,_errors"
+        }
+      },
+      "id": "3b04ed97-2899-54e9-8fbe-d8ed4fbff2de",
+      "name": "Airtable: upsert by Sale ID",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        740,
+        200
+      ],
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "AirtablePAT00001",
+          "name": "Airtable PAT"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Create or Update, merge on 'Sale ID' = idempotent. Same sale twice -> same row.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "errorMessage": "=Invalid Gumroad payload (sale {{ $json['Sale ID'] || '?' }}): {{ $json._errors }}"
+      },
+      "id": "e2907cbc-0eb7-51ff-af01-8acb2ab3fb96",
+      "name": "Reject invalid payload",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        740,
+        420
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "6400785c-afa5-516e-a643-2645cc7b6703",
+      "name": "On any error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds a readable alert from the Error Trigger output.\n// Runs for: Airtable write failed (after 3 retries), invalid Gumroad payload, any other crash.\nconst e = $input.first().json;\nconst exec = e.execution || {};\nconst trig = e.trigger || {};\nconst err = exec.error || trig.error || {};\nconst wf = (e.workflow && e.workflow.name) || 'Gumroad -> Airtable';\n\nconst subject = `[n8n] ${wf} failed: ${(err.message || 'unknown error').slice(0, 120)}`;\nconst text = [\n  `Workflow: ${wf}`,\n  `Failed node: ${exec.lastNodeExecuted || '(trigger)'}`,\n  `Error: ${err.message || 'unknown'}`,\n  exec.url ? `Open the failed run: ${exec.url}` : null,\n  exec.id ? `Execution ID: ${exec.id}` : null,\n  `Time (UTC): ${new Date().toISOString()}`,\n  '',\n  'This event may be missing in Airtable. Fix the cause, then either retry the execution',\n  'from the link above or run the \"Gumroad -> Airtable: backfill & reconcile\" workflow,',\n  'which re-syncs recent sales without creating duplicates.',\n]\n  .filter((l) => l !== null)\n  .join('\\n');\n\nreturn [{ json: { subject, text } }];\n"
+      },
+      "id": "129d46cc-87aa-5661-97bf-274a2db0905f",
+      "name": "Format alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "n8n-alerts@example.com",
+        "toEmail": "you@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "de7c666f-4b1f-535d-a531-52f1e3aad189",
+      "name": "Email alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        440,
+        700
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "SmtpAlerts000001",
+          "name": "SMTP (alerts)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Gumroad Ping (sale webhook)": {
+      "main": [
+        [
+          {
+            "node": "Normalize & validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & validate": {
+      "main": [
+        [
+          {
+            "node": "Valid sale?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid sale?": {
+      "main": [
+        [
+          {
+            "node": "Airtable: upsert by Sale ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject invalid payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On any error": {
+      "main": [
+        [
+          {
+            "node": "Format alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format alert": {
+      "main": [
+        [
+          {
+            "node": "Email alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

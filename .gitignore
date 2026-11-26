@@ -1,0 +1,24 @@
+# local n8n used for the end-to-end check (large, machine-specific)
+.n8n-runtime/
+.n8n-local/
+node_modules/
+e2e_out/
+
+# private notes, not part of the demo
+proposal_EN.txt
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# data / secrets
+*.sqlite
+*.sqlite-*
+*.db
+.env
+.env.*
+
+# os
+.DS_Store
